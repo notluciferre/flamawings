@@ -1,0 +1,23 @@
+{
+    "mode": "headless",
+    "server": {
+        "host": "donutsmp.net",
+        "port": 19132,
+        "version": "1.21.110",
+        "autoVersion": true
+    },
+    "auth": {
+        "username": "rexusgeming",
+        "offline": false
+    },
+    "behavior": {
+        "commandDelayMs": 5000,
+        "guiTimeoutMs": 10000,
+        "slotIndex": 16,
+        "targetCommand": "/tpa"
+    },
+    "debug": {
+        "logPackets": false,
+        "logStateChanges": true
+    }
+}

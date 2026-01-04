@@ -1,0 +1,25 @@
+{
+  "name": "bedrock-afk-client",
+  "version": "1.0.0",
+  "description": "Headless Bedrock client for DonutSMP automation",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": [
+    "minecraft",
+    "bedrock",
+    "protocol",
+    "headless"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "bedrock-protocol": "^3.52.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
