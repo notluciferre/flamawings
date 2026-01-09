@@ -1,53 +1,79 @@
-# Bedrock AFK Client - DonutSMP Automation
+# Bedrock Headless Client
 
-Headless Bedrock client untuk automasi DonutSMP dengan dukungan mode GUI dan headless.
+Simple headless Bedrock client untuk koneksi ke Minecraft Bedrock server.
 
-## 🎯 Target & Workflow
+## 🎯 Features
 
-**Server**: donutsmp.net:19132
+- Connect ke Bedrock server
+- Execute commands
+- Auto-ping dengan command ke server
+- Auto-reconnect jika server tidak merespon
+- Ping monitoring dengan timeout detection
 
-**Flow Eksekusi**:
-
-1. RakNet handshake
-2. Login (PlayStatus: LOGIN_SUCCESS)
-3. Resource pack negotiation
-4. StartGame packet
-5. Tunggu AvailableCommandsPacket
-6. Tunggu InventoryContentPacket (player inventory)
-7. **State READY** - kirim command `/tpa`
-8. Tunggu ContainerOpenPacket (chest GUI)
-9. Tunggu InventoryContentPacket (chest slots)
-10. Kirim InventoryTransactionPacket (click slot 16)
-11. Selesai / handle response
-
----
-
-## 📁 Arsitektur Program
+## 📁 Struktur
 
 ```
 src/
-├── index.js              # Main entry point & orchestrator
-├── StateMachine.js       # State machine client
-├── BedrockClient.js      # RakNet & login handler
-├── CommandHandler.js     # Command packet handler
-├── GUIHandler.js         # Container & inventory handler
-└── Logger.js             # Logging utility
+└── index.js              # Main program
 
-config.json               # Konfigurasi server & behavior
+config.json               # Konfigurasi
 package.json              # Dependencies
 ```
 
-### Module Responsibilities
+## ⚙️ Configuration
 
-#### 1. **StateMachine.js**
+File `config.json`:
 
-State flow client dengan validasi transisi:
-
+```json
+{
+  "server": {
+    "ip": "example.server.net",
+    "port": 19132
+  },
+  "ping": {
+    "intervalMs": 5000,
+    "timeoutMs": 15000,
+    "command": "ping",
+    "autoReconnect": true,
+    "reconnectDelayMs": 3000
+  }
+}
 ```
-DISCONNECTED → CONNECTING → AUTHENTICATING → RESOURCE_PACKS →
-SPAWNING → WAITING_COMMANDS → READY → COMMAND_SENT →
-WAITING_GUI → GUI_RECEIVED → CLICKING_SLOT → COMPLETED/ERROR
+
+### Konfigurasi:
+
+- `server.ip` - IP atau hostname server
+- `server.port` - Port server (default: 19132)
+- `ping.intervalMs` - Interval kirim ping command (ms)
+- `ping.timeoutMs` - Timeout untuk deteksi disconnect (ms)
+- `ping.command` - Command yang dikirim untuk ping (default: "ping")
+- `ping.autoReconnect` - Enable/disable auto-reconnect
+- `ping.reconnectDelayMs` - Delay sebelum reconnect (ms)
+
+## 🚀 Usage
+
+Install dependencies:
+
+```bash
+npm install
 ```
+
+Run program:
+
+```bash
+npm start
+```
+
+## 📝 Commands
+
+- `connect` - Connect ke server
+- `disconnect` - Disconnect dari server
+- `exec <command>` - Execute command (contoh: `exec help`, `exec list`)
+- `exit` - Keluar dari program
+
+## 📦 Dependencies
+
+- `bedrock-protocol` - Minecraft Bedrock protocol implementation
 
 - `canTransition(newState)`: Validasi transisi
 - `setCommandsAvailable()`: Mark commands ready
