@@ -8,6 +8,6 @@
     "timeoutMs": 15000,
     "command": "ping",
     "autoReconnect": true,
-    "reconnectDelayMs": 3000
+    "reconnectDelayMs": 15000
   }
 }

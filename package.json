@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
+    "node": "node src/node-server.js",
     "dev": "node --watch src/index.js"
   },
   "keywords": [
@@ -17,7 +18,8 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "bedrock-protocol": "^3.52.0"
+    "bedrock-protocol": "^3.52.0",
+    "dotenv": "^17.2.3"
   },
   "engines": {
     "node": ">=18.0.0"
