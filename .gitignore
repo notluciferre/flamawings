@@ -1,7 +1,37 @@
+# Dependencies
 node_modules/
-*.log
+package-lock.json
+
+# Environment & Config
 .env
+.env.local
+config.json
 config.local.json
+
+# Data files
+bots.json
+proxy.txt
+
+# Auth cache
 authcache/
 .auth-cache/
+
+# Build artifacts & archives
+*.zip
+dist/
+build/
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Test artifacts
 img.png
