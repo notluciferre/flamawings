@@ -3,11 +3,10 @@
     "ip": "donutsmp.net",
     "port": 19132
   },
-  "ping": {
-    "intervalMs": 30000,
-    "timeoutMs": 15000,
-    "command": "ping",
-    "autoReconnect": true,
-    "reconnectDelayMs": 15000
+  "testBot": {
+    "username": "leonkennedy3275",
+    "server_ip": "donutsmp.net",
+    "server_port": 19132,
+    "offline_mode": false
   }
 }

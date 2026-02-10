@@ -26,6 +26,12 @@ const CONFIG = {
   // Log Configuration
   logBatchInterval: parseInt(process.env.LOG_BATCH_INTERVAL) || 1000,
   logBatchSize: parseInt(process.env.LOG_BATCH_SIZE) || 50,
+  
+  // Proxy Configuration
+  proxyHost: process.env.PROXY_HOST || null,
+  proxyPort: process.env.PROXY_PORT ? parseInt(process.env.PROXY_PORT) : null,
+  proxyUsername: process.env.PROXY_USERNAME || null,
+  proxyPassword: process.env.PROXY_PASSWORD || null,
 };
 
 // Bot clients management - Map of bot_id -> bot instance
@@ -171,13 +177,20 @@ async function flushLogBatch(botId) {
     const data = await response.json();
     
     if (!data.success) {
+      // Check if it's a foreign key error (bot doesn't exist)
+      if (data.error && data.error.includes('foreign key constraint')) {
+        logWarn(`Bot ${botId} not found in database, discarding ${logs.length} log(s)`);
+        // Don't re-add logs if bot doesn't exist
+        return;
+      }
+      
       logError(`Failed to send log batch to API: ${data.error}`);
-      // Re-add logs to queue on failure
+      // Re-add logs to queue on other errors
       logBatchQueue.get(botId).push(...logs);
     }
   } catch (err) {
     logError(`Failed to send log batch to API: ${err.message}`);
-    // Re-add logs to queue on failure
+    // Re-add logs to queue on network errors
     logBatchQueue.get(botId).push(...logs);
   }
 }
@@ -289,11 +302,6 @@ async function sendHeartbeat() {
 async function pollCommands() {
   if (!nodeId) return;
   
-  // Skip polling if no bots running
-  if (botClients.size === 0) {
-    return;
-  }
-  
   try {
     const response = await fetch(
       `${CONFIG.apiUrl}/api/commands/poll?node_id=${nodeId}&secret_key=${CONFIG.nodeSecretKey}`
@@ -304,8 +312,23 @@ async function pollCommands() {
     if (data.success && data.commands.length > 0) {
       logInfo(`Received ${data.commands.length} command(s)`);
       
-      // Process commands in parallel for faster execution
-      await Promise.all(data.commands.map(command => processCommand(command)));
+      // Separate start/create commands from others
+      const startCommands = data.commands.filter(cmd => cmd.action === 'start' || cmd.action === 'create');
+      const otherCommands = data.commands.filter(cmd => cmd.action !== 'start' && cmd.action !== 'create');
+      
+      // Process start/create commands sequentially with 3s delay to prevent race conditions
+      for (const command of startCommands) {
+        await processCommand(command);
+        if (startCommands.indexOf(command) < startCommands.length - 1) {
+          logInfo('Waiting 3 seconds before next bot creation...');
+          await new Promise(resolve => setTimeout(resolve, 3000));
+        }
+      }
+      
+      // Process other commands in parallel for faster execution
+      if (otherCommands.length > 0) {
+        await Promise.all(otherCommands.map(command => processCommand(command)));
+      }
     }
   } catch (error) {
     logError(`Poll commands error: ${error.message}`);
@@ -381,8 +404,24 @@ async function startBot(command) {
   
   // Check if bot already exists
   if (botClients.has(bot_id)) {
+    const bot = botClients.get(bot_id);
     logWarn(`Bot ${bot_id} (${username}) already running`);
-    return { message: 'Bot already running' };
+    
+    // Update status to ensure it's correct
+    if (bot.connected) {
+      await updateBotStatus(bot_id, 'running');
+      return { 
+        message: 'Bot already running and connected', 
+        username,
+        status: 'running'
+      };
+    } else {
+      // Bot exists but not connected - reconnect
+      logInfo(`Bot ${username} not connected, restarting...`);
+      bot.client.close();
+      botClients.delete(bot_id);
+      // Continue to create new bot below
+    }
   }
   
   try {
@@ -425,14 +464,14 @@ async function startBot(command) {
       return originalStdoutWrite(chunk, encoding, callback);
     };
     
-    // Restore stdout after 20 seconds
+    // Restore stdout after 40 seconds (extended timeout)
     setTimeout(() => {
       process.stdout.write = originalStdoutWrite;
       if (!authResolved) {
         authResolved = true;
         authResolve({ needsAuth: false });
       }
-    }, 20000);
+    }, 40000);
     
     const clientOptions = {
       host: server_ip,
@@ -441,7 +480,25 @@ async function startBot(command) {
       offline: offline_mode !== false, // Default true if not specified
     };
     
+    // Add proxy if configured
+    if (CONFIG.proxyHost && CONFIG.proxyPort) {
+      clientOptions.proxy = {
+        host: CONFIG.proxyHost,
+        port: CONFIG.proxyPort,
+      };
+      
+      // Add proxy auth if provided
+      if (CONFIG.proxyUsername && CONFIG.proxyPassword) {
+        clientOptions.proxy.username = CONFIG.proxyUsername;
+        clientOptions.proxy.password = CONFIG.proxyPassword;
+      }
+      
+      logInfo(`[${username}] Using proxy: ${CONFIG.proxyHost}:${CONFIG.proxyPort}`);
+    }
+    
     const client = bedrock.createClient(clientOptions);
+    
+    logInfo(`[${username}] Client created, setting up connection...`);
     
     // Store bot instance
     botClients.set(bot_id, {
@@ -454,6 +511,8 @@ async function startBot(command) {
       connected: false,
       lastActivity: Date.now(),
       authPromise: waitForAuth,
+      reconnectAttempts: 0,
+      maxReconnectAttempts: 5,
     });
     
     // Setup event handlers
@@ -461,6 +520,8 @@ async function startBot(command) {
     
     // Wait for auth if online mode
     if (!offline_mode) {
+      // Add small delay to prevent concurrent connection issues
+      await new Promise(resolve => setTimeout(resolve, 2000));
       logInfo(`[${username}] Waiting for auth...`);
       const authResult = await waitForAuth;
       
@@ -472,6 +533,23 @@ async function startBot(command) {
           username,
           auth: { code: authResult.code, link: authResult.link }
         };
+      }
+      
+      // After auth, wait for spawn with timeout
+      logInfo(`[${username}] Auth complete, waiting for spawn...`);
+      const spawnTimeout = setTimeout(() => {
+        if (botClients.has(bot_id)) {
+          const bot = botClients.get(bot_id);
+          if (!bot.connected) {
+            logWarn(`[${username}] Spawn timeout after 30s - forcing reconnect`);
+            client.disconnect();
+          }
+        }
+      }, 30000);
+      
+      // Store timeout so it can be cleared on spawn
+      if (botClients.has(bot_id)) {
+        botClients.get(bot_id).spawnTimeout = spawnTimeout;
       }
     }
     
@@ -596,6 +674,13 @@ function setupBotHandlers(botId, client) {
     logInfo(`[${bot.username}] Spawned in game`);
     bot.connected = true;
     bot.lastActivity = Date.now();
+    bot.reconnectAttempts = 0; // Reset reconnect counter on successful spawn
+    
+    // Clear spawn timeout if exists
+    if (bot.spawnTimeout) {
+      clearTimeout(bot.spawnTimeout);
+      bot.spawnTimeout = null;
+    }
     
     // Update status to running
     updateBotStatus(botId, 'running');
@@ -611,21 +696,49 @@ function setupBotHandlers(botId, client) {
     
     // Auto-reconnect if enabled
     if (bot.auto_reconnect && botClients.has(botId)) {
-      logInfo(`[${bot.username}] Auto-reconnecting in 15 seconds...`);
+      bot.reconnectAttempts = (bot.reconnectAttempts || 0) + 1;
+      
+      if (bot.reconnectAttempts > (bot.maxReconnectAttempts || 5)) {
+        logError(`[${bot.username}] Max reconnect attempts reached (${bot.reconnectAttempts}), giving up`);
+        updateBotStatus(botId, 'stopped', 'Max reconnect attempts reached');
+        botClients.delete(botId);
+        return;
+      }
+      
+      // Exponential backoff: 5s, 10s, 20s, 40s, 80s
+      const delay = Math.min(5000 * Math.pow(2, bot.reconnectAttempts - 1), 80000);
+      logInfo(`[${bot.username}] Auto-reconnecting in ${delay/1000}s (attempt ${bot.reconnectAttempts}/${bot.maxReconnectAttempts})...`);
+      
       setTimeout(() => {
         if (botClients.has(botId)) {
-          // Recreate client
-          const newClient = bedrock.createClient({
+          // Recreate client with proxy config
+          const reconnectOptions = {
             host: bot.server_ip,
             port: bot.server_port,
             username: bot.username,
             offline: bot.offline_mode !== false,
-          });
+          };
+          
+          // Add proxy if configured
+          if (CONFIG.proxyHost && CONFIG.proxyPort) {
+            reconnectOptions.proxy = {
+              host: CONFIG.proxyHost,
+              port: CONFIG.proxyPort,
+            };
+            
+            if (CONFIG.proxyUsername && CONFIG.proxyPassword) {
+              reconnectOptions.proxy.username = CONFIG.proxyUsername;
+              reconnectOptions.proxy.password = CONFIG.proxyPassword;
+            }
+          }
+          
+          logInfo(`[${bot.username}] Attempting reconnection...`);
+          const newClient = bedrock.createClient(reconnectOptions);
           
           bot.client = newClient;
           setupBotHandlers(botId, newClient);
         }
-      }, 15000);
+      }, delay);
     }
   });
   
@@ -658,6 +771,18 @@ function setupBotHandlers(botId, client) {
   
   client.on('error', (error) => {
     logError(`[${bot.username}] Error: ${error.message}`);
+    // Mark as not connected on error
+    bot.connected = false;
+  });
+  
+  // Handle close event (fires before disconnect)
+  client.on('close', () => {
+    logInfo(`[${bot.username}] Connection closed`);
+  });
+  
+  // Handle kick event
+  client.on('kick', (reason) => {
+    logWarn(`[${bot.username}] Kicked: ${reason?.message || 'Unknown reason'}`);
   });
 }
 
@@ -680,6 +805,12 @@ async function mainLoop() {
   logInfo(`Log batch size: ${CONFIG.logBatchSize}`);
   logInfo(`Node name: ${CONFIG.nodeName}`);
   logInfo(`Node location: ${CONFIG.nodeLocation}`);
+  
+  if (CONFIG.proxyHost && CONFIG.proxyPort) {
+    logInfo(`Proxy enabled: ${CONFIG.proxyHost}:${CONFIG.proxyPort}`);
+  } else {
+    logInfo(`Proxy: disabled`);
+  }
   
   // Log batch flushing interval
   setInterval(async () => {
