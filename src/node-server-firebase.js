@@ -9,8 +9,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import bedrock from 'bedrock-protocol';
 import { initializeApp } from 'firebase/app';
-import { getDatabase, ref, onValue, set, push, update, onChildAdded } from 'firebase/database';
-import proxyManager from './proxy-manager.js';
+import { getDatabase, ref, set, push, onChildAdded, get, query, orderByChild, equalTo, update } from 'firebase/database';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,8 +20,8 @@ try {
   const configPath = path.join(__dirname, '..', 'config.json');
   const configFile = fs.readFileSync(configPath, 'utf8');
   config = JSON.parse(configFile);
-} catch (err) {
-  console.error('❌ Failed to load config.json!');
+} catch (error) {
+  console.error('❌ Failed to load config.json:', error.message);
   console.error('Please copy config.example.json to config.json and fill in your settings');
   process.exit(1);
 }
@@ -50,8 +49,25 @@ const CONFIG = {
 };
 
 const botClients = new Map();
+const processedCommands = new Set(); // Track processed command IDs
 let nodeId = null;
 let db = null;
+let heartbeatTimer = null;
+let lastCommandTime = 0;
+
+// Smart Heartbeat Configuration
+const HEARTBEAT_CONFIG = {
+  idle: 60000,      // 60s when no bots running
+  active: 15000,    // 15s with bots running
+  burst: 5000,      // 5s after recent command
+  burstDuration: 30000, // 30s burst mode duration
+};
+
+// Retry configuration
+const RETRY_CONFIG = {
+  maxRetries: 3,
+  baseDelay: 1000,
+};
 
 // Logger
 function getTimestamp() {
@@ -78,52 +94,83 @@ function initFirebase() {
   }
 }
 
+// Listen for commands in realtime from Firebase
 function listenForCommands() {
-  if (!db) {
-    logError('[Error] Firebase not initialized - cannot listen for commands');
+  if (!db || !nodeId) {
+    logError('[Cmd Listen] Cannot listen - Firebase or nodeId not ready');
     return;
   }
-  
-  const commandsRef = ref(db, `nodes/${nodeId}/commands`);
-  
-  onChildAdded(commandsRef, async (snapshot) => {
-    const command = snapshot.val();
+
+  // Query commands for this node that are pending
+  const commandsRef = ref(db, 'commands');
+  const nodeCommandsQuery = query(
+    commandsRef,
+    orderByChild('node_id'),
+    equalTo(nodeId)
+  );
+
+  logInfo('[Cmd Listen] Listening for commands from Firebase RTDB...');
+
+  // Listen for new commands
+  onChildAdded(nodeCommandsQuery, async (snapshot) => {
     const commandId = snapshot.key;
+    const command = snapshot.val();
+
+    // Skip if already processed
+    if (processedCommands.has(commandId)) {
+      return;
+    }
+
+    // Only process pending commands
+    if (command.status !== 'pending') {
+      processedCommands.add(commandId);
+      return;
+    }
+
+    logInfo(`[Cmd Listen] New command: ${command.action} for bot ${command.bot_id} (${commandId})`);
     
-    logInfo(`New command received: ${command.action}`);
-    
-    // Process command
+    // Mark as processed to avoid duplicates
+    processedCommands.add(commandId);
+
+    // Mark command as processing
+    try {
+      await update(ref(db, `commands/${commandId}`), {
+        status: 'processing',
+        processed_at: Date.now(),
+      });
+    } catch (err) {
+      logError(`[Cmd Listen] Failed to mark command as processing: ${err.message}`);
+    }
+
+    // Process the command
     await processCommand(command, commandId);
-    
-    // Remove processed command
-    await set(ref(db, `nodes/${nodeId}/commands/${commandId}`), null);
   });
-  
-  logInfo('Listening for commands on Firebase...');
 }
 
 async function updateNodeStatus(data) {
-  if (!db) {
-    logError('[Error] Firebase not initialized');
+  if (!nodeId) {
+    logError('[Error] Node not registered yet');
     return;
   }
+
   try {
-    await set(ref(db, `nodes/${nodeId}/status`), {
-      ...data,
-      lastUpdate: Date.now(),
+    // Send heartbeat to API endpoint
+    const response = await fetch(`${CONFIG.apiUrl}/api/node/heartbeat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        node_id: nodeId,
+        secret_key: 'cn-12345678abcdefghij', // Must match NODE_SECRET_KEY in .env
+        stats: data.stats || {},
+      }),
     });
-  } catch (err) {
-    logError(`Failed to update node status: ${err.message}`);
-    if (err.code === 'PERMISSION_DENIED') {
-      logError('❌ Firebase Rules Error! Follow these steps:');
-      logError('1. Open: https://console.firebase.google.com/');
-      logError('2. Select your project');
-      logError('3. Go to: Realtime Database → Rules');
-      logError('4. Replace with: { "rules": { ".read": true, ".write": true } }');
-      logError('5. Click Publish');
-      logError('6. Restart this server');
-      process.exit(1);
+
+    const result = await response.json();
+    if (!result.success) {
+      logError(`Heartbeat failed: ${result.error}`);
     }
+  } catch (err) {
+    logError(`Failed to send heartbeat: ${err.message}`);
   }
 }
 
@@ -132,14 +179,23 @@ async function updateBotStatus(botId, status, error = null) {
     logError('[Error] Firebase not initialized');
     return;
   }
-  try {
-    await set(ref(db, `bots/${botId}/status`), {
-      status,
-      error,
-      timestamp: Date.now(),
-    });
-  } catch (err) {
-    logError(`Failed to update bot status: ${err.message}`);
+  
+  // Retry logic for Firebase writes
+  for (let attempt = 0; attempt < RETRY_CONFIG.maxRetries; attempt++) {
+    try {
+      await set(ref(db, `bots/${botId}/status`), {
+        status,
+        error,
+        timestamp: Date.now(),
+      });
+      return; // Success
+    } catch (err) {
+      logError(`Failed to update bot status (attempt ${attempt + 1}): ${err.message}`);
+      
+      if (attempt < RETRY_CONFIG.maxRetries - 1) {
+        await new Promise(resolve => setTimeout(resolve, RETRY_CONFIG.baseDelay * Math.pow(2, attempt)));
+      }
+    }
   }
 }
 
@@ -148,7 +204,25 @@ async function addBotLog(botId, logType, message) {
     logError('[Error] Firebase not initialized');
     return;
   }
+  
+  // Single attempt for logs (not critical)
   try {
+    // Do not write logs older than logs_cleared_at
+    try {
+      const clearedSnap = await get(ref(db, `bots/${botId}/logs_cleared_at`));
+      const clearedAt = clearedSnap?.val?.() || clearedSnap?.val && clearedSnap.val();
+      if (clearedAt) {
+        const createdAt = new Date().toISOString();
+        if (new Date(createdAt) <= new Date(clearedAt)) {
+          logInfo(`[${botId}] Skipping log write because created_at <= logs_cleared_at (${createdAt} <= ${clearedAt})`);
+          return;
+        }
+      }
+    } catch (e) {
+      // If we cannot read cleared timestamp, proceed to write log to avoid losing critical info
+      logWarn(`[${botId}] Could not read logs_cleared_at before writing log: ${e.message}`);
+    }
+
     const logsRef = ref(db, `bots/${botId}/logs`);
     await push(logsRef, {
       log_type: logType,
@@ -156,21 +230,62 @@ async function addBotLog(botId, logType, message) {
       created_at: new Date().toISOString(),
     });
   } catch (err) {
+    // Just log error, don't retry for logs
     logError(`Failed to add bot log: ${err.message}`);
   }
 }
 
-// Send heartbeat every 10 secondsa
+// Get adaptive heartbeat interval based on bot activity
+function getHeartbeatInterval() {
+  const activeBots = Array.from(botClients.values())
+    .filter(bot => bot.client?.status === 'online').length;
+  
+  // Burst mode: after recent command
+  const timeSinceCommand = Date.now() - lastCommandTime;
+  if (timeSinceCommand < HEARTBEAT_CONFIG.burstDuration) {
+    return HEARTBEAT_CONFIG.burst;
+  }
+  
+  // Active mode: bots are running
+  if (activeBots > 0) {
+    return HEARTBEAT_CONFIG.active;
+  }
+  
+  // Idle mode: no bots
+  return HEARTBEAT_CONFIG.idle;
+}
+
+// Smart heartbeat with adaptive interval
 function startHeartbeat() {
-  setInterval(async () => {
+  let currentInterval = HEARTBEAT_CONFIG.idle;
+  
+  const sendHeartbeat = async () => {
     const stats = getSystemStats();
     await updateNodeStatus({
-      online: true,
       stats,
     });
-  }, 10000);
+    
+    // Check if interval needs adjustment
+    const newInterval = getHeartbeatInterval();
+    if (newInterval !== currentInterval) {
+      currentInterval = newInterval;
+      logInfo(`Heartbeat interval adjusted to ${currentInterval}ms`);
+      
+      // Restart timer with new interval
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+      }
+      heartbeatTimer = setInterval(sendHeartbeat, currentInterval);
+    }
+  };
   
-  logInfo('Heartbeat started (10s interval)');
+  // Initial heartbeat
+  sendHeartbeat();
+  
+  // Start timer
+  heartbeatTimer = setInterval(sendHeartbeat, currentInterval);
+  
+  logInfo(`Smart heartbeat started (adaptive: ${HEARTBEAT_CONFIG.idle}ms idle, ${HEARTBEAT_CONFIG.active}ms active, ${HEARTBEAT_CONFIG.burst}ms burst)`);
 }
 
 // Get system stats
@@ -235,6 +350,9 @@ async function registerNode() {
 
 // Process command
 async function processCommand(command, commandId) {
+  // Track command time for burst mode heartbeat
+  lastCommandTime = Date.now();
+  
   logInfo(`Processing: ${command.action} for bot ${command.bot_id || 'N/A'} (commandId: ${commandId})`);
   
   try {
@@ -263,31 +381,73 @@ async function processCommand(command, commandId) {
         result = { error: `Unknown action: ${command.action}` };
     }
     
-    // Update command result in Firebase
-    const resultPath = `commands/${commandId}/result`;
-    logInfo(`Saving command result to: ${resultPath}`);
-    logInfo(`Result data:`, JSON.stringify(result, null, 2));
+    // Update command result in Firebase RTDB
+    const status = result.error ? 'failed' : 'completed';
+    logInfo(`[Cmd Process] Updating command ${commandId} status: ${status}`);
     
-    await set(ref(db, resultPath), {
-      status: result.error ? 'failed' : 'completed',
-      result,
-      timestamp: Date.now(),
-    });
-    
-    logInfo(`Command result saved successfully`);
+    try {
+      await update(ref(db, `commands/${commandId}`), {
+        status,
+        result: result,
+        completed_at: Date.now(),
+      });
+      logInfo(`[Cmd Process] Command ${commandId} marked as ${status}`);
+    } catch (updateErr) {
+      logError(`[Cmd Process] Failed to update command in Firebase: ${updateErr.message}`);
+    }
   } catch (err) {
-    logError(`Command error: ${err.message}`);
-    await set(ref(db, `commands/${commandId}/result`), {
-      status: 'failed',
-      result: { error: err.message },
-      timestamp: Date.now(),
-    });
+    logError(`[Cmd Process] Error: ${err.message}`);
+    
+    // Mark command as failed in Firebase
+    try {
+      await update(ref(db, `commands/${commandId}`), {
+        status: 'failed',
+        result: { error: err.message },
+        completed_at: Date.now(),
+      });
+    } catch (updateErr) {
+      logError(`[Cmd Process] Failed to update failed status: ${updateErr.message}`);
+    }
   }
+}
+
+// Auto reconnect function
+async function reconnectBot(bot_id, payload, retryCount = 0) {
+  // Check if already reconnecting
+  const existingBot = botClients.get(bot_id);
+  if (existingBot && existingBot.reconnecting) {
+    logInfo(`[${payload.username}] Already reconnecting, skipping duplicate call`);
+    return;
+  }
+  
+  const maxRetries = 999999; // Unlimited reconnect
+  const delay = 5000; // Fixed 5 seconds delay
+  
+  if (retryCount >= maxRetries) {
+    logError(`[${payload.username}] Max reconnect attempts reached (${maxRetries})`);
+    await updateBotStatus(bot_id, 'error', 'Max reconnect attempts reached');
+    return;
+  }
+  
+  // Mark as reconnecting
+  if (existingBot) {
+    existingBot.reconnecting = true;
+  }
+  
+  logInfo(`[${payload.username}] Reconnecting in ${delay/1000}s... (attempt ${retryCount + 1})`);
+  await addBotLog(bot_id, 'info', `🔄 Reconnecting in ${delay/1000}s... (attempt ${retryCount + 1})`);
+  
+  setTimeout(() => {
+    logInfo(`[${payload.username}] Attempting reconnect #${retryCount + 1}...`);
+    startBot({ bot_id, payload, retryCount: retryCount + 1 }).catch(err => {
+      logError(`[${payload.username}] Reconnect failed: ${err.message}`);
+    });
+  }, delay);
 }
 
 // Start bot
 async function startBot(command) {
-  const { bot_id, payload } = command;
+  const { bot_id, payload, retryCount = 0 } = command;
   
   // Handle both old and new command formats
   if (!payload || !payload.username) {
@@ -368,20 +528,19 @@ async function startBot(command) {
     port: server_port || 19132,
     username,
     offline: offline_mode !== false,
+    version: '1.21.130',
   };
   
-  // Add proxy if available
-  const proxy = proxyManager.getRandom();
-  if (proxy) {
-    clientOptions.proxy = {
-      host: proxy.host,
-      port: proxy.port,
-      type: proxy.type,
-    };
-    logInfo(`Using proxy: ${proxy.host}:${proxy.port}`);
-  }
+  logInfo(`[${username}] Connecting directly to ${server_ip}:${server_port}`);
   
-  const client = bedrock.createClient(clientOptions);
+  let client;
+  try {
+    client = bedrock.createClient(clientOptions);
+  } catch (err) {
+    logError(`[${username}] Failed to create client: ${err.message}`);
+    await updateBotStatus(bot_id, 'error', `Failed to create client: ${err.message}`);
+    return { error: err.message };
+  }
   
   botClients.set(bot_id, {
     client,
@@ -390,32 +549,27 @@ async function startBot(command) {
     server_ip,
     server_port,
     offline_mode,
+    authResolve,  // Store for later use
+    retryCount,   // Track reconnect attempts
+    payload,      // Store original payload for reconnect
+    reconnecting: false,  // Flag to prevent duplicate reconnects
   });
   
-  // Connection timeout (30 seconds)
+  // Connection timeout (60 seconds for online mode to allow auth time)
+  const timeoutDuration = offline_mode ? 30000 : 60000;
   const connectionTimeout = setTimeout(() => {
-    if (!botClients.get(bot_id)?.connected) {
-      logError(`[${username}] Connection timeout (30s) - trying different proxy`);
-      if (client) client.close();
-      botClients.delete(bot_id);
-      
-      // Retry with different proxy after 2 seconds
-      setTimeout(() => {
-        logInfo(`[${username}] Retrying connection...`);
-        startBot(command).catch(err => {
-          logError(`[${username}] Retry failed: ${err.message}`);
-          updateBotStatus(bot_id, 'error', 'Connection failed after retry');
-        });
-      }, 2000);
+    const bot = botClients.get(bot_id);
+    if (bot && !bot.connected && !bot.manuallyStopped) {
+      logError(`[${username}] Connection timeout (${timeoutDuration/1000}s)`);
+      if (client) client.close();  // Will trigger 'close' event which handles reconnect
     }
-  }, 30000);
+  }, timeoutDuration);
   
   // Handle connection errors
   client.on('error', (err) => {
     clearTimeout(connectionTimeout);
     logError(`[${username}] Connection error: ${err.message}`);
-    updateBotStatus(bot_id, 'error', err.message);
-    botClients.delete(bot_id);
+    // Don't reconnect here - close event will handle it
   });
   
   client.on('spawn', () => {
@@ -431,8 +585,7 @@ async function startBot(command) {
     clearTimeout(connectionTimeout);
     const reason = packet?.message || 'Unknown';
     logWarn(`[${username}] Disconnected: ${reason}`);
-    updateBotStatus(bot_id, 'stopped', reason);
-    botClients.delete(bot_id);
+    // Don't reconnect here - close event will handle it
   });
   
   client.on('text', (packet) => {
@@ -447,24 +600,44 @@ async function startBot(command) {
     clearTimeout(connectionTimeout);
     const reason = packet?.message || 'Kicked from server';
     logError(`[${username}] Kicked: ${reason}`);
-    updateBotStatus(bot_id, 'error', reason);
-    botClients.delete(bot_id);
+    // Don't reconnect here - close event will handle it
   });
   
   client.on('close', () => {
-    logWarn(`[${username}] Connection closed`);
+    clearTimeout(connectionTimeout);
+    const bot = botClients.get(bot_id);
+    
+    // Don't reconnect if manually stopped
+    if (bot && bot.manuallyStopped) {
+      logWarn(`[${username}] Connection closed (manual stop)`);
+      botClients.delete(bot_id);
+      return;
+    }
+    
+    if (bot && bot.connected === false) {
+      logError(`[${username}] Connection closed before spawn`);
+      botClients.delete(bot_id);
+      reconnectBot(bot_id, bot.payload, bot.retryCount);
+    } else if (bot) {
+      logWarn(`[${username}] Connection closed normally`);
+      botClients.delete(bot_id);
+      reconnectBot(bot_id, bot.payload, bot.retryCount);
+    }
   });
   
-  // Wait for auth if online mode
+  // For online mode, wait briefly for auth detection before returning
   if (!offline_mode) {
-    logInfo(`[${username}] Waiting for auth detection (40s timeout)...`);
-    const authResult = await waitForAuth;
+    logInfo(`[${username}] Waiting up to 15s for auth detection...`);
     
-    logInfo(`[${username}] Auth detection complete: needsAuth=${authResult.needsAuth}`);
+    // Wait up to 15 seconds for auth detection
+    const authResult = await Promise.race([
+      waitForAuth,
+      new Promise(resolve => setTimeout(() => resolve({ needsAuth: false }), 15000))
+    ]);
     
     if (authResult.needsAuth) {
-      logInfo(`[${username}] Returning auth requirement to frontend...`);
-      await addBotLog(bot_id, 'info', `⏳ Waiting for Xbox authentication - check console for login code`);
+      logInfo(`[${username}] Auth required! Returning code to frontend...`);
+      await addBotLog(bot_id, 'info', `⏳ Waiting for Xbox authentication...`);
       
       return {
         message: 'Authentication required',
@@ -472,7 +645,7 @@ async function startBot(command) {
         auth: { code: authResult.code, link: authResult.link }
       };
     } else {
-      logInfo(`[${username}] No auth required, bot will continue connecting...`);
+      logInfo(`[${username}] No auth detected in 15s, proceeding without auth...`);
     }
   }
   
@@ -487,6 +660,16 @@ async function stopBot(command) {
   if (!bot) return { message: 'Bot not found' };
   
   logInfo(`Stopping: ${bot.username}`);
+  
+  // Prevent force-stop while bot is still starting (not connected)
+  if (bot.connected === false) {
+    logWarn(`[${bot.username}] Stop requested while bot is starting; rejecting force-stop`);
+    return { error: 'Cannot stop while bot is starting' };
+  }
+
+  // Mark as manually stopped to prevent auto-reconnect
+  bot.manuallyStopped = true;
+  
   if (bot.client) bot.client.close();
   botClients.delete(bot_id);
   
@@ -502,6 +685,10 @@ async function deleteBot(command) {
   const bot = botClients.get(bot_id);
   if (bot) {
     logInfo(`Stopping bot ${bot.username} before deletion...`);
+    
+    // Mark as manually stopped to prevent reconnect
+    bot.manuallyStopped = true;
+    
     if (bot.client) bot.client.close();
     botClients.delete(bot_id);
   } else {
@@ -573,7 +760,6 @@ async function execCommand(command) {
 // Main
 async function main() {
   logInfo('=== CakraNode - Firebase Realtime Version ===');
-  logInfo(`Proxy system: ${proxyManager.getCount()} proxies loaded`);
   
   const registered = await registerNode();
   if (!registered) {
@@ -585,16 +771,16 @@ async function main() {
   logInfo('Node registered, initializing Firebase...');
   initFirebase();
   
-  // Set node online
-  await updateNodeStatus({ online: true, stats: getSystemStats() });
+  // Send initial heartbeat to set node online
+  await updateNodeStatus({ stats: getSystemStats() });
   
-  // Start listening for commands
+  // Start listening for commands from Firebase RTDB
   listenForCommands();
   
   // Start heartbeat
   startHeartbeat();
   
-  logInfo('Firebase node server running!');
+  logInfo('Node server running with Firebase Realtime Database!');
 }
 
 main();

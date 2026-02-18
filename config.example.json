@@ -1,15 +1,15 @@
 {
   "apiUrl": "https://cakranode.vercel.app",
-  "accessToken": "cn-your-token-here",
+  "accessToken": "cn-18593250d3a61b5629c3e451d7206dd6a8622186f981799744059b78172caa27",
   "nodeIp": "auto",
   "firebase": {
-    "apiKey": "your_api_key_here",
-    "authDomain": "your-project.firebaseapp.com",
-    "databaseURL": "https://your-project.firebaseio.com",
-    "projectId": "your-project-id",
-    "storageBucket": "your-project.appspot.com",
-    "messagingSenderId": "123456789",
-    "appId": "1:123456789:web:abcdef123456"
+    "apiKey": "AIzaSyD3pCB3iG0QwigkIGpbTdtjY2ql8KXTcKI",
+    "authDomain": "cakranode.firebaseapp.com",
+    "databaseURL": "https://cakranode-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "projectId": "cakranode",
+    "storageBucket": "cakranode.firebasestorage.app",
+    "messagingSenderId": "612209389430",
+    "appId": "1:612209389430:web:5095540c88a4abe8e19457"
   },
   "proxy": {
     "host": null,

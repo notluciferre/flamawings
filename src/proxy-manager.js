@@ -37,8 +37,23 @@ class ProxyManager {
 
   parseProxy(proxyString) {
     try {
-      // Remove http:// prefix if present
-      let cleaned = proxyString.replace(/^https?:\/\//, '');
+      let type = 'socks5'; // Default
+      let cleaned = proxyString;
+      
+      // Detect proxy type from prefix
+      if (proxyString.startsWith('http://')) {
+        type = 'http';
+        cleaned = proxyString.replace('http://', '');
+      } else if (proxyString.startsWith('https://')) {
+        type = 'http'; // HTTPS proxy still uses 'http' type
+        cleaned = proxyString.replace('https://', '');
+      } else if (proxyString.startsWith('socks5://')) {
+        type = 'socks5';
+        cleaned = proxyString.replace('socks5://', '');
+      } else if (proxyString.startsWith('socks4://')) {
+        type = 'socks4';
+        cleaned = proxyString.replace('socks4://', '');
+      }
       
       // Parse host:port
       const parts = cleaned.split(':');
@@ -52,7 +67,7 @@ class ProxyManager {
       return {
         host,
         port,
-        type: 'socks5', // Try SOCKS5 first, fallback to HTTP if needed
+        type,
       };
     } catch (err) {
       return null;
