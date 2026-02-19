@@ -9,7 +9,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import bedrock from 'bedrock-protocol';
 import { initializeApp } from 'firebase/app';
-import { getDatabase, ref, set, push, onChildAdded, get, query, orderByChild, equalTo, update } from 'firebase/database';
+import { getDatabase, ref, set, push, onChildAdded, remove, get } from 'firebase/database';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -49,25 +49,8 @@ const CONFIG = {
 };
 
 const botClients = new Map();
-const processedCommands = new Set(); // Track processed command IDs
 let nodeId = null;
 let db = null;
-let heartbeatTimer = null;
-let lastCommandTime = 0;
-
-// Smart Heartbeat Configuration
-const HEARTBEAT_CONFIG = {
-  idle: 60000,      // 60s when no bots running
-  active: 15000,    // 15s with bots running
-  burst: 5000,      // 5s after recent command
-  burstDuration: 30000, // 30s burst mode duration
-};
-
-// Retry configuration
-const RETRY_CONFIG = {
-  maxRetries: 3,
-  baseDelay: 1000,
-};
 
 // Logger
 function getTimestamp() {
@@ -97,70 +80,45 @@ function initFirebase() {
 // Listen for commands in realtime from Firebase
 function listenForCommands() {
   if (!db || !nodeId) {
-    logError('[Cmd Listen] Cannot listen - Firebase or nodeId not ready');
+    logError('Cannot listen - Firebase or nodeId not ready');
     return;
   }
 
-  // Query commands for this node that are pending
-  const commandsRef = ref(db, 'commands');
-  const nodeCommandsQuery = query(
-    commandsRef,
-    orderByChild('node_id'),
-    equalTo(nodeId)
-  );
+  const commandsRef = ref(db, `nodes/${nodeId}/commands`);
+  logInfo('Listening for commands from Firebase RTDB...');
 
-  logInfo('[Cmd Listen] Listening for commands from Firebase RTDB...');
-
-  // Listen for new commands
-  onChildAdded(nodeCommandsQuery, async (snapshot) => {
+  onChildAdded(commandsRef, async (snapshot) => {
     const commandId = snapshot.key;
     const command = snapshot.val();
 
-    // Skip if already processed
-    if (processedCommands.has(commandId)) {
-      return;
-    }
-
-    // Only process pending commands
-    if (command.status !== 'pending') {
-      processedCommands.add(commandId);
-      return;
-    }
-
-    logInfo(`[Cmd Listen] New command: ${command.action} for bot ${command.bot_id} (${commandId})`);
+    logInfo(`New command: ${command.action} for bot ${command.bot_id || 'N/A'}`);
     
-    // Mark as processed to avoid duplicates
-    processedCommands.add(commandId);
-
-    // Mark command as processing
-    try {
-      await update(ref(db, `commands/${commandId}`), {
-        status: 'processing',
-        processed_at: Date.now(),
-      });
-    } catch (err) {
-      logError(`[Cmd Listen] Failed to mark command as processing: ${err.message}`);
-    }
-
     // Process the command
-    await processCommand(command, commandId);
+    await processCommand(command);
+
+    // Delete the command after processing
+    try {
+      await remove(ref(db, `nodes/${nodeId}/commands/${commandId}`));
+      logInfo(`Command ${commandId} deleted from Firebase`);
+    } catch (err) {
+      logError(`Failed to delete command: ${err.message}`);
+    }
   });
 }
 
 async function updateNodeStatus(data) {
   if (!nodeId) {
-    logError('[Error] Node not registered yet');
+    logError('Node not registered yet');
     return;
   }
 
   try {
-    // Send heartbeat to API endpoint
     const response = await fetch(`${CONFIG.apiUrl}/api/node/heartbeat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         node_id: nodeId,
-        secret_key: 'cn-12345678abcdefghij', // Must match NODE_SECRET_KEY in .env
+        secret_key: 'cn-12345678abcdefghij',
         stats: data.stats || {},
       }),
     });
@@ -176,51 +134,36 @@ async function updateNodeStatus(data) {
 
 async function updateBotStatus(botId, status, error = null) {
   if (!db) {
-    logError('[Error] Firebase not initialized');
+    logError('Firebase not initialized');
     return;
   }
   
-  // Retry logic for Firebase writes
-  for (let attempt = 0; attempt < RETRY_CONFIG.maxRetries; attempt++) {
-    try {
-      await set(ref(db, `bots/${botId}/status`), {
-        status,
-        error,
-        timestamp: Date.now(),
-      });
-      return; // Success
-    } catch (err) {
-      logError(`Failed to update bot status (attempt ${attempt + 1}): ${err.message}`);
-      
-      if (attempt < RETRY_CONFIG.maxRetries - 1) {
-        await new Promise(resolve => setTimeout(resolve, RETRY_CONFIG.baseDelay * Math.pow(2, attempt)));
-      }
-    }
+  try {
+    await set(ref(db, `bots/${botId}/status`), {
+      status,
+      error,
+      timestamp: Date.now(),
+    });
+  } catch (err) {
+    logError(`Failed to update bot status: ${err.message}`);
   }
 }
 
 async function addBotLog(botId, logType, message) {
   if (!db) {
-    logError('[Error] Firebase not initialized');
+    logError('Firebase not initialized');
     return;
   }
   
-  // Single attempt for logs (not critical)
   try {
-    // Do not write logs older than logs_cleared_at
-    try {
-      const clearedSnap = await get(ref(db, `bots/${botId}/logs_cleared_at`));
-      const clearedAt = clearedSnap?.val?.() || clearedSnap?.val && clearedSnap.val();
-      if (clearedAt) {
-        const createdAt = new Date().toISOString();
-        if (new Date(createdAt) <= new Date(clearedAt)) {
-          logInfo(`[${botId}] Skipping log write because created_at <= logs_cleared_at (${createdAt} <= ${clearedAt})`);
-          return;
-        }
+    // Check if logs were cleared
+    const clearedSnap = await get(ref(db, `bots/${botId}/logs_cleared_at`));
+    const clearedAt = clearedSnap?.val();
+    if (clearedAt) {
+      const createdAt = new Date().toISOString();
+      if (new Date(createdAt) <= new Date(clearedAt)) {
+        return;
       }
-    } catch (e) {
-      // If we cannot read cleared timestamp, proceed to write log to avoid losing critical info
-      logWarn(`[${botId}] Could not read logs_cleared_at before writing log: ${e.message}`);
     }
 
     const logsRef = ref(db, `bots/${botId}/logs`);
@@ -230,62 +173,18 @@ async function addBotLog(botId, logType, message) {
       created_at: new Date().toISOString(),
     });
   } catch (err) {
-    // Just log error, don't retry for logs
     logError(`Failed to add bot log: ${err.message}`);
   }
 }
 
-// Get adaptive heartbeat interval based on bot activity
-function getHeartbeatInterval() {
-  const activeBots = Array.from(botClients.values())
-    .filter(bot => bot.client?.status === 'online').length;
-  
-  // Burst mode: after recent command
-  const timeSinceCommand = Date.now() - lastCommandTime;
-  if (timeSinceCommand < HEARTBEAT_CONFIG.burstDuration) {
-    return HEARTBEAT_CONFIG.burst;
-  }
-  
-  // Active mode: bots are running
-  if (activeBots > 0) {
-    return HEARTBEAT_CONFIG.active;
-  }
-  
-  // Idle mode: no bots
-  return HEARTBEAT_CONFIG.idle;
-}
-
-// Smart heartbeat with adaptive interval
+// Fixed 10s heartbeat
 function startHeartbeat() {
-  let currentInterval = HEARTBEAT_CONFIG.idle;
-  
-  const sendHeartbeat = async () => {
+  setInterval(async () => {
     const stats = getSystemStats();
-    await updateNodeStatus({
-      stats,
-    });
-    
-    // Check if interval needs adjustment
-    const newInterval = getHeartbeatInterval();
-    if (newInterval !== currentInterval) {
-      currentInterval = newInterval;
-      logInfo(`Heartbeat interval adjusted to ${currentInterval}ms`);
-      
-      // Restart timer with new interval
-      if (heartbeatTimer) {
-        clearInterval(heartbeatTimer);
-      }
-      heartbeatTimer = setInterval(sendHeartbeat, currentInterval);
-    }
-  };
+    await updateNodeStatus({ stats });
+  }, 10000);
   
-  // Initial heartbeat
-  sendHeartbeat();
-  
-  // Start timer
-  heartbeatTimer = setInterval(sendHeartbeat, currentInterval);
-  
-  logInfo(`Smart heartbeat started (adaptive: ${HEARTBEAT_CONFIG.idle}ms idle, ${HEARTBEAT_CONFIG.active}ms active, ${HEARTBEAT_CONFIG.burst}ms burst)`);
+  logInfo('Heartbeat started (10s interval)');
 }
 
 // Get system stats
@@ -349,11 +248,8 @@ async function registerNode() {
 }
 
 // Process command
-async function processCommand(command, commandId) {
-  // Track command time for burst mode heartbeat
-  lastCommandTime = Date.now();
-  
-  logInfo(`Processing: ${command.action} for bot ${command.bot_id || 'N/A'} (commandId: ${commandId})`);
+async function processCommand(command) {
+  logInfo(`Processing: ${command.action} for bot ${command.bot_id || 'N/A'}`);
   
   try {
     let result = {};
@@ -362,6 +258,15 @@ async function processCommand(command, commandId) {
       case 'create':
       case 'start':
         result = await startBot(command);
+        // If auth is required, save to Firebase for frontend to read
+        if (result.auth) {
+          await set(ref(db, `bots/${command.bot_id}/auth_pending`), {
+            code: result.auth.code,
+            link: result.auth.link,
+            timestamp: Date.now(),
+          });
+          logInfo(`Auth code saved to Firebase for bot ${command.bot_id}`);
+        }
         break;
       case 'stop':
         result = await stopBot(command);
@@ -370,6 +275,14 @@ async function processCommand(command, commandId) {
         await stopBot(command);
         await new Promise(r => setTimeout(r, 2000));
         result = await startBot(command);
+        // Save auth if needed
+        if (result.auth) {
+          await set(ref(db, `bots/${command.bot_id}/auth_pending`), {
+            code: result.auth.code,
+            link: result.auth.link,
+            timestamp: Date.now(),
+          });
+        }
         break;
       case 'delete':
         result = await deleteBot(command);
@@ -381,58 +294,31 @@ async function processCommand(command, commandId) {
         result = { error: `Unknown action: ${command.action}` };
     }
     
-    // Update command result in Firebase RTDB
-    const status = result.error ? 'failed' : 'completed';
-    logInfo(`[Cmd Process] Updating command ${commandId} status: ${status}`);
-    
-    try {
-      await update(ref(db, `commands/${commandId}`), {
-        status,
-        result: result,
-        completed_at: Date.now(),
-      });
-      logInfo(`[Cmd Process] Command ${commandId} marked as ${status}`);
-    } catch (updateErr) {
-      logError(`[Cmd Process] Failed to update command in Firebase: ${updateErr.message}`);
-    }
+    logInfo(`Command completed: ${JSON.stringify(result)}`);
   } catch (err) {
-    logError(`[Cmd Process] Error: ${err.message}`);
-    
-    // Mark command as failed in Firebase
-    try {
-      await update(ref(db, `commands/${commandId}`), {
-        status: 'failed',
-        result: { error: err.message },
-        completed_at: Date.now(),
-      });
-    } catch (updateErr) {
-      logError(`[Cmd Process] Failed to update failed status: ${updateErr.message}`);
-    }
+    logError(`Command error: ${err.message}`);
   }
 }
 
 // Auto reconnect function
 async function reconnectBot(bot_id, payload, retryCount = 0) {
-  // Check if already reconnecting
+  // Check if auto_reconnect is enabled
+  if (payload.auto_reconnect === false) {
+    logInfo(`[${payload.username}] Auto-reconnect disabled, not reconnecting`);
+    await updateBotStatus(bot_id, 'stopped');
+    return;
+  }
+  
   const existingBot = botClients.get(bot_id);
   if (existingBot && existingBot.reconnecting) {
-    logInfo(`[${payload.username}] Already reconnecting, skipping duplicate call`);
+    logInfo(`[${payload.username}] Already reconnecting, skipping duplicate`);
     return;
   }
   
-  const maxRetries = 999999; // Unlimited reconnect
-  const delay = 5000; // Fixed 5 seconds delay
+  const delay = 5000;
   
-  if (retryCount >= maxRetries) {
-    logError(`[${payload.username}] Max reconnect attempts reached (${maxRetries})`);
-    await updateBotStatus(bot_id, 'error', 'Max reconnect attempts reached');
-    return;
-  }
-  
-  // Mark as reconnecting
-  if (existingBot) {
-    existingBot.reconnecting = true;
-  }
+  // Set status to reconnecting
+  await updateBotStatus(bot_id, 'reconnecting');
   
   logInfo(`[${payload.username}] Reconnecting in ${delay/1000}s... (attempt ${retryCount + 1})`);
   await addBotLog(bot_id, 'info', `🔄 Reconnecting in ${delay/1000}s... (attempt ${retryCount + 1})`);
@@ -455,16 +341,23 @@ async function startBot(command) {
     return { error: 'Invalid command format - missing payload' };
   }
   
-  const { username, server_ip, server_port, offline_mode } = payload;
+  const { username, server_ip, server_port, offline_mode, auto_reconnect } = payload;
   
+  // Force stop existing bot if already running (user control is absolute)
   if (botClients.has(bot_id)) {
-    return { message: 'Bot already running', username };
+    logWarn(`[${username}] Bot already running, force stopping first...`);
+    const existingBot = botClients.get(bot_id);
+    existingBot.manuallyStopped = true;
+    if (existingBot.client) existingBot.client.close();
+    botClients.delete(bot_id);
+    await new Promise(r => setTimeout(r, 1000)); // Wait 1s before restarting
   }
   
-  logInfo(`Starting: ${username} -> ${server_ip}:${server_port} (${offline_mode ? 'offline' : 'online'} mode)`);
+  logInfo(`Starting: ${username} -> ${server_ip}:${server_port} (${offline_mode ? 'offline' : 'online'} mode, auto_reconnect: ${auto_reconnect !== false})`);
   
   // Update status to starting
   await updateBotStatus(bot_id, 'starting');
+  await addBotLog(bot_id, 'info', `🚀 Starting bot...`);
   
   // Setup Xbox auth detection for online mode
   let authResolve = null;
@@ -549,10 +442,12 @@ async function startBot(command) {
     server_ip,
     server_port,
     offline_mode,
+    auto_reconnect: auto_reconnect !== false,
     authResolve,  // Store for later use
     retryCount,   // Track reconnect attempts
     payload,      // Store original payload for reconnect
     reconnecting: false,  // Flag to prevent duplicate reconnects
+    manuallyStopped: false,  // Flag to prevent reconnects when user stops
   });
   
   // Connection timeout (60 seconds for online mode to allow auth time)
@@ -566,10 +461,36 @@ async function startBot(command) {
   }, timeoutDuration);
   
   // Handle connection errors
-  client.on('error', (err) => {
+  client.on('error', async (err) => {
     clearTimeout(connectionTimeout);
     logError(`[${username}] Connection error: ${err.message}`);
-    // Don't reconnect here - close event will handle it
+    
+    const bot = botClients.get(bot_id);
+    
+    // Don't reconnect if manually stopped
+    if (bot && bot.manuallyStopped) {
+      botClients.delete(bot_id);
+      return;
+    }
+    
+    // For ping timeout and other errors, trigger reconnect if auto_reconnect enabled
+    if (bot && !bot.reconnecting) {
+      bot.reconnecting = true; // Set flag before delete
+      addBotLog(bot_id, 'error', `❌ Connection error: ${err.message}`);
+      updateBotStatus(bot_id, 'error', err.message);
+      
+      const shouldReconnect = bot.auto_reconnect !== false;
+      logInfo(`[${username}] Connection error, auto_reconnect: ${shouldReconnect}`);
+      
+      botClients.delete(bot_id);
+      
+      if (shouldReconnect) {
+        reconnectBot(bot_id, bot.payload, bot.retryCount);
+      } else {
+        logInfo(`[${username}] Auto-reconnect disabled, stopping bot`);
+        await updateBotStatus(bot_id, 'stopped');
+      }
+    }
   });
   
   client.on('spawn', () => {
@@ -578,7 +499,7 @@ async function startBot(command) {
     const bot = botClients.get(bot_id);
     if (bot) bot.connected = true;
     updateBotStatus(bot_id, 'running');
-    addBotLog(bot_id, 'info', 'Bot spawned successfully');
+    addBotLog(bot_id, 'info', '✅ Bot connected and running');
   });
   
   client.on('disconnect', (packet) => {
@@ -607,21 +528,44 @@ async function startBot(command) {
     clearTimeout(connectionTimeout);
     const bot = botClients.get(bot_id);
     
+    // Skip if already deleted (handled by error event)
+    if (!bot) {
+      logInfo(`[${username}] Connection closed (already handled)`);
+      return;
+    }
+    
     // Don't reconnect if manually stopped
-    if (bot && bot.manuallyStopped) {
+    if (bot.manuallyStopped) {
       logWarn(`[${username}] Connection closed (manual stop)`);
       botClients.delete(bot_id);
       return;
     }
     
-    if (bot && bot.connected === false) {
-      logError(`[${username}] Connection closed before spawn`);
+    // Don't reconnect if already reconnecting
+    if (bot.reconnecting) {
+      logWarn(`[${username}] Connection closed (already reconnecting)`);
+      return;
+    }
+    
+    // Check auto_reconnect setting
+    const shouldReconnect = bot.auto_reconnect !== false;
+    
+    if (bot.connected === false) {
+      logError(`[${username}] Connection closed before spawn, auto_reconnect: ${shouldReconnect}`);
       botClients.delete(bot_id);
-      reconnectBot(bot_id, bot.payload, bot.retryCount);
-    } else if (bot) {
-      logWarn(`[${username}] Connection closed normally`);
+      if (shouldReconnect) {
+        reconnectBot(bot_id, bot.payload, bot.retryCount);
+      } else {
+        updateBotStatus(bot_id, 'stopped');
+      }
+    } else {
+      logWarn(`[${username}] Connection closed normally, auto_reconnect: ${shouldReconnect}`);
       botClients.delete(bot_id);
-      reconnectBot(bot_id, bot.payload, bot.retryCount);
+      if (shouldReconnect) {
+        reconnectBot(bot_id, bot.payload, bot.retryCount);
+      } else {
+        updateBotStatus(bot_id, 'stopped');
+      }
     }
   });
   
@@ -657,23 +601,25 @@ async function stopBot(command) {
   const { bot_id } = command;
   const bot = botClients.get(bot_id);
   
-  if (!bot) return { message: 'Bot not found' };
+  if (!bot) {
+    logWarn(`Stop requested for bot ${bot_id} but not found in memory`);
+    // Still update status to stopped in case it's in a bad state
+    await updateBotStatus(bot_id, 'stopped');
+    await addBotLog(bot_id, 'info', '⏹️ Bot stopped');
+    return { message: 'Bot stopped (was not running)' };
+  }
   
   logInfo(`Stopping: ${bot.username}`);
+  await addBotLog(bot_id, 'info', '⏹️ Stopping bot...');
   
-  // Prevent force-stop while bot is still starting (not connected)
-  if (bot.connected === false) {
-    logWarn(`[${bot.username}] Stop requested while bot is starting; rejecting force-stop`);
-    return { error: 'Cannot stop while bot is starting' };
-  }
-
-  // Mark as manually stopped to prevent auto-reconnect
+  // Mark as manually stopped to prevent auto-reconnect (ABSOLUTE USER CONTROL)
   bot.manuallyStopped = true;
   
   if (bot.client) bot.client.close();
   botClients.delete(bot_id);
   
-  updateBotStatus(bot_id, 'stopped');
+  await updateBotStatus(bot_id, 'stopped');
+  await addBotLog(bot_id, 'info', '✅ Bot stopped successfully');
   return { message: 'Bot stopped', username: bot.username };
 }
 
